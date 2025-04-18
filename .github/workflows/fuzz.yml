@@ -1,65 +1,121 @@
-name: WebP Fuzzing Lab 🧨
+name: Fuzz WebP with AFL++
 
 on:
-  workflow_dispatch:
   push:
-    branches: [ "main" ]
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    - cron: '0 0 * * *'  # Daily
 
 jobs:
   fuzz:
-    name: Fuzz libwebp (Roundtrip)
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 360  # 6 hours max
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v3
+    - name: Checkout repository
+      uses: actions/checkout@v3
 
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y build-essential clang cmake \
-            autoconf automake libtool zlib1g-dev \
-            radamsa wget git afl++ lcov
+    - name: Install AFL++
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential python3-dev
+        git clone https://github.com/AFLplusplus/AFLplusplus.git
+        cd AFLplusplus
+        make -j$(nproc)
+        sudo make install
+        cd ..
 
-      - name: Install AFL++
-        run: |
-          git clone https://github.com/AFLplusplus/AFLplusplus
-          cd AFLplusplus
-          make distrib -j$(nproc)
-          sudo make install
+    - name: Install dependencies
+      run: |
+        sudo apt-get install -y autoconf automake libtool
 
-      - name: Clone & Build libwebp
-        run: |
-          git clone https://chromium.googlesource.com/webm/libwebp
-          cd libwebp
-          ./autogen.sh
-          ./configure --disable-shared --enable-static
-          make -j$(nproc)
+    - name: Clone libwebp
+      run: git clone https://github.com/webmproject/libwebp.git
 
-      - name: Build fuzz_webp_roundtrip.c
-        run: |
-          export CC=afl-clang-lto
-          export AFL_USE_ASAN=1
-          clang -fsanitize=address,fuzzer -O2 -g \
-            fuzz_webp_roundtrip.c \
-            -Ilibwebp/src -Llibwebp/.libs -lwebp \
-            -o fuzz_webp_roundtrip
+    - name: Build libwebp with AFL++ and ASAN
+      run: |
+        cd libwebp
+        ./autogen.sh
+        AFL_USE_ASAN=1 CC=afl-clang-fast CXX=afl-clang-fast++ ./configure --disable-shared
+        make -j$(nproc)
+        cd ..
 
-      - name: Prepare seed corpus
-        run: |
-          mkdir seeds
-          wget https://raw.githubusercontent.com/webmproject/libwebp/main/test_data/test.webp -O seeds/test.webp
-          radamsa -n 50 -o seeds/rad_%n.webp seeds/test.webp
+    - name: Write round trip harness
+      run: |
+        cat > harness.c <<'EOF'
+        #include <stdio.h>
+        #include <stdlib.h>
+        #include <webp/decode.h>
+        #include <webp/encode.h>
 
-      - name: Start fuzzing
-        run: |
-          afl-fuzz -i seeds -o fuzz_output -V 120 -- ./fuzz_webp_roundtrip @@
-        timeout-minutes: 10
+        int main() {
+            uint8_t *data = NULL;
+            size_t size = 0;
+            size_t capacity = 0;
 
-      - name: Upload crashes
-        if: success() || failure()
-        uses: actions/upload-artifact
-        with:
-          name: crash-output
-          path: fuzz_output/default/crashes/
+            // Read input from stdin
+            while (!feof(stdin)) {
+                if (size + 1024 > capacity) {
+                    capacity = capacity ? capacity * 2 : 1024;
+                    data = realloc(data, capacity);
+                    if (!data) {
+                        fprintf(stderr, "Memory allocation failed\n");
+                        return 1;
+                    }
+                }
+                size_t read = fread(data + size, 1, capacity - size, stdin);
+                if (read == 0) break;
+                size += read;
+            }
+
+            if (size == 0) {
+                fprintf(stderr, "No input data\n");
+                return 1;
+            }
+
+            // Decode WebP
+            int width, height;
+            uint8_t *decoded = WebPDecodeRGBA(data, size, &width, &height);
+            free(data);
+            if (!decoded) return 0;  // Silently ignore decode errors
+
+            // Encode back to WebP
+            uint8_t *encoded;
+            size_t encoded_size = WebPEncodeRGBA(decoded, width, height, width * 4, 75.0f, &encoded);
+            free(decoded);
+            if (!encoded) return 0;
+
+            // Decode again
+            int width2, height2;
+            uint8_t *decoded2 = WebPDecodeRGBA(encoded, encoded_size, &width2, &height2);
+            free(encoded);
+            if (decoded2) free(decoded2);
+
+            return 0;
+        }
+        EOF
+
+    - name: Compile harness
+      run: |
+        afl-clang-fast -Ilibwebp/src -fsanitize=address,undefined -o harness harness.c libwebp/src/.libs/libwebp.a -lm
+
+    - name: Prepare initial corpus
+      run: |
+        mkdir -p input_corpus
+        # Generate a simple WebP image using cwebp (from libwebp)
+        convert -size 32x32 xc:white test.png  # Requires imagemagick
+        libwebp/examples/cwebp -quiet test.png -o input_corpus/test.webp
+        rm test.png
+
+    - name: Run AFL++
+      run: |
+        afl-fuzz -i input_corpus -o output -m none -t 10000 -- ./harness @@
+
+    - name: Upload findings
+      if: always()
+      uses: actions/upload-artifact@v3
+      with:
+        name: afl++-findings
+        path: output
