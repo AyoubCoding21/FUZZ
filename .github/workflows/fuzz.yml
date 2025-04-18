@@ -22,14 +22,14 @@ jobs:
             autoconf automake libtool zlib1g-dev \
             radamsa wget git afl++ lcov
 
-      - name: 🐚 Install AFL++
+      - name: Install AFL++
         run: |
           git clone https://github.com/AFLplusplus/AFLplusplus
           cd AFLplusplus
           make distrib -j$(nproc)
           sudo make install
 
-      - name: 🧱 Clone & Build libwebp
+      - name: Clone & Build libwebp
         run: |
           git clone https://chromium.googlesource.com/webm/libwebp
           cd libwebp
@@ -59,7 +59,7 @@ jobs:
 
       - name: Upload crashes
         if: success() || failure()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact
         with:
           name: crash-output
           path: fuzz_output/default/crashes/
