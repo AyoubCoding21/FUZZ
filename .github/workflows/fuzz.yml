@@ -1,0 +1,65 @@
+name: WebP Fuzzing Lab 🧨
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  fuzz:
+    name: Fuzz libwebp (Roundtrip)
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y build-essential clang cmake \
+            autoconf automake libtool zlib1g-dev \
+            radamsa wget git afl++ lcov
+
+      - name: 🐚 Install AFL++
+        run: |
+          git clone https://github.com/AFLplusplus/AFLplusplus
+          cd AFLplusplus
+          make distrib -j$(nproc)
+          sudo make install
+
+      - name: 🧱 Clone & Build libwebp
+        run: |
+          git clone https://chromium.googlesource.com/webm/libwebp
+          cd libwebp
+          ./autogen.sh
+          ./configure --disable-shared --enable-static
+          make -j$(nproc)
+
+      - name: Build fuzz_webp_roundtrip.c
+        run: |
+          export CC=afl-clang-lto
+          export AFL_USE_ASAN=1
+          clang -fsanitize=address,fuzzer -O2 -g \
+            fuzz_webp_roundtrip.c \
+            -Ilibwebp/src -Llibwebp/.libs -lwebp \
+            -o fuzz_webp_roundtrip
+
+      - name: Prepare seed corpus
+        run: |
+          mkdir seeds
+          wget https://raw.githubusercontent.com/webmproject/libwebp/main/test_data/test.webp -O seeds/test.webp
+          radamsa -n 50 -o seeds/rad_%n.webp seeds/test.webp
+
+      - name: Start fuzzing
+        run: |
+          afl-fuzz -i seeds -o fuzz_output -V 120 -- ./fuzz_webp_roundtrip @@
+        timeout-minutes: 10
+
+      - name: Upload crashes
+        if: success() || failure()
+        uses: actions/upload-artifact@v3
+        with:
+          name: crash-output
+          path: fuzz_output/default/crashes/
